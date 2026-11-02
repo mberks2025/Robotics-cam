@@ -1,0 +1,17 @@
+# colcon
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+# cloned by scripts/04_build_workspace.sh
+ros2_ws/src/realsense-ros/
+# TensorRT engines are tied to the GPU + TensorRT version: build them on the Jetson
+*.engine
+*.onnx
+# bags and logs
+*.mcap
+*.db3
+d435i_vio_test*/
+tegrastats_*.log
+__pycache__/
+*.pyc
+.pytest_cache/

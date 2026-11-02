@@ -1,0 +1,24 @@
+# d435i_usb2.yaml: fallback while the camera is still on a USB 2.1 link.
+# USB 2 cannot carry stereo IR + depth + color, so IR is off and everything runs at 15 fps.
+# Not usable for VIO (no IR pair). Move to a USB 3 cable/port and use d435i_orin.yaml.
+initial_reset: true
+
+enable_color: true
+rgb_camera.color_profile: 640x480x15
+rgb_camera.color_format: RGB8
+
+enable_depth: true
+depth_module.depth_profile: 640x480x15
+enable_infra1: false
+enable_infra2: false
+depth_module.emitter_enabled: 1
+
+enable_gyro: true
+enable_accel: true
+gyro_fps: 200
+accel_fps: 250
+unite_imu_method: 2
+
+align_depth.enable: true
+pointcloud.enable: false
+enable_sync: false

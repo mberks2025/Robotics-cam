@@ -1,0 +1,25 @@
+# d435i_orin.yaml: the default profile. One realsense2_camera node publishes
+# color, depth, stereo IR and a fused IMU for every consumer (YOLO, terrain,
+# OpenVINS / cuVSLAM, AprilTags). Needs USB 3 (check: "Device USB type: 3.x").
+initial_reset: true                  # resets the camera if a previous run did not close it cleanly
+
+enable_color: true
+rgb_camera.color_profile: 640x480x15
+rgb_camera.color_format: RGB8
+
+enable_depth: true
+depth_module.depth_profile: 640x480x30
+enable_infra1: true
+enable_infra2: true
+depth_module.infra_profile: 640x480x30   # depth and IR share one sensor: keep the same fps
+depth_module.emitter_enabled: 0      # 0 = off (VIO / IR runs), 1 = on (depth / terrain runs)
+
+enable_gyro: true
+enable_accel: true
+gyro_fps: 200
+accel_fps: 250
+unite_imu_method: 2                  # 0 none, 1 copy, 2 linear_interpolation -> /camera/camera/imu
+
+align_depth.enable: false            # true only when a node needs depth per color pixel (detector profile)
+pointcloud.enable: false             # leave off; the terrain code builds its own height map
+enable_sync: false
