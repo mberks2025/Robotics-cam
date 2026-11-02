@@ -11,7 +11,9 @@ here. Set full power first (`sudo nvpmodel -m 0 && sudo jetson_clocks`) and log 
 - [ ] Baseline: camera node alone (vio profile), note RAM and CPU per core from tegrastats
 - [ ] `yolo benchmark model=models/yolo26n.pt imgsz=640 device=0` to confirm the published TensorRT times
 - [ ] Detector with the FP16 engine at 640, then at 416 (`IMGSZ=416 ./scripts/export_yolo_trt.sh`, launch with `imgsz:=416` param); end-to-end rate with `ros2 topic hz /detections`
-- [ ] Peak RAM with camera node + detector (+ terrain node once it exists) all running
+- [ ] Terrain node alone (`terrain.launch.py`): processing ms from `/terrain/features`, RAM from tegrastats (desktop estimate was about 130 MB)
+- [ ] Terrain on real ground: a 30-40 cm rock and a dug hole at 1-2 m are reported with the right size and position
+- [ ] Peak RAM with camera node + detector + terrain node all running
 - [ ] Only if named classes are needed: fine-tune YOLO26n on rover-view images, re-export, compare mAP
 
 ## Reference numbers (Ultralytics, Orin Nano Super, JetPack 6.1, 640 px, inference only)
@@ -34,3 +36,4 @@ rate, not the model. Source: [Ultralytics Jetson guide](https://docs.ultralytics
 | | FP16, 640 | detect | | | |
 | | FP16, 416 | detect | | | |
 | | INT8, 640 | detect | | | needs calibration set |
+| | terrain node | terrain | | | |

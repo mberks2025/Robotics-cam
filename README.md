@@ -1,7 +1,8 @@
 # Robotics-cam: D435i vision stack on Jetson Orin Nano
 
 Bring-up kit for the rover's Intel RealSense D435i on a Jetson Orin Nano 8 GB:
-one ROS 2 camera node for color, depth, stereo IR and IMU, plus a YOLO26n TensorRT detector.
+one ROS 2 camera node for color, depth, stereo IR and IMU, a depth-only terrain detector
+(bumps, dips, hidden areas), and a YOLO26n TensorRT detector.
 Obstacles come from **depth** (anything that isn't open ground); YOLO is only for things that
 need a name (people, targets).
 
@@ -68,6 +69,15 @@ ros2 launch robot_bringup camera.launch.py profile:=usb2     # still on USB 2.1:
 ros2 launch robot_bringup detector.launch.py                 # publishes vision_msgs/Detection3DArray on /detections
 ros2 launch robot_bringup detector.launch.py debug_image:=true   # also /detections/image for rviz2 (costs CPU)
 ros2 topic echo /detections --once
+
+# Camera + terrain detection (depth + IMU, emitter on)
+ros2 launch robot_bringup terrain.launch.py debug_image:=true
+ros2 topic echo /terrain/features      # JSON: kind, x/y position, length, width, height, volume
+# rviz2: Fixed Frame terrain_ground, Map display on /terrain/grid, Image display on /terrain/image
+
+# Terrain detection without ROS (opens the camera itself), or on a simulated scene
+python3 tools/terrain_detect.py --headless
+python3 tools/terrain_detect.py --sim --headless
 ```
 
 Switch the emitter live without restarting: `ros2 param set /camera/camera depth_module.emitter_enabled 1`.
@@ -84,6 +94,8 @@ file's argument list; the node still applies them.
 | `/camera/camera/imu` | sensor_msgs/Imu | ~200 Hz |
 | `/camera/camera/aligned_depth_to_color/image_raw` | sensor_msgs/Image | detect profile only |
 | `/detections` | vision_msgs/Detection3DArray | up to color rate |
+| `/terrain/grid` | nav_msgs/OccupancyGrid (-1 unknown, 0 free, 100 hazard) | up to 5 Hz |
+| `/terrain/features` | std_msgs/String (JSON) | up to 5 Hz |
 
 ### First-day checklist
 
@@ -93,6 +105,7 @@ file's argument list; the node still applies them.
 - [ ] rviz2 (Fixed Frame `camera_link`) shows color, depth, both IR images and TF
 - [ ] `./scripts/record_vio_bag.sh` saved a 1-2 minute walk-around bag (for OpenVINS / cuVSLAM)
 - [ ] Engine exported; `detector.launch.py` publishes `/detections`
+- [ ] `terrain.launch.py`: camera height in the log matches the mount, a box or rock in front shows up as a bump
 - [ ] Benchmarks logged in [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
 
 ## Repo layout
@@ -103,13 +116,15 @@ ros2_ws/src/robot_bringup/   camera profiles (config/*.yaml) and launch files
 ros2_ws/src/rover_perception/
   rover_perception/yolo_detector.py   YOLO node: color + aligned depth in, Detection3DArray out
   rover_perception/depth_utils.py     box_distance() from the original script, pixel -> 3D
-  rover_perception/terrain_node.py    placeholder + design for the depth terrain grid
+  rover_perception/terrain_core.py    ground fit, 5 cm height map, bumps / dips / hidden areas, features (numpy only)
+  rover_perception/terrain_node.py    ROS 2 wrapper: /terrain/grid, /terrain/features, /terrain/image, TF
 models/yolo26n.pt            COCO weights the team tested; the .engine is built on the Jetson (gitignored)
-tools/realsense_detect.py    original standalone test (opens the camera itself)
+tools/realsense_detect.py    original standalone YOLO test (opens the camera itself)
+tools/terrain_detect.py      standalone terrain test (live camera or --sim)
 docs/                        roadmap, benchmark plan, troubleshooting, original team notes
 ```
 
-Unit tests for the depth helpers: `cd ros2_ws && colcon test --packages-select rover_perception && colcon test-result --verbose`.
+Unit tests (depth helpers and terrain detection on a simulated scene): `cd ros2_ws && colcon test --packages-select rover_perception && colcon test-result --verbose`.
 
 ## More
 

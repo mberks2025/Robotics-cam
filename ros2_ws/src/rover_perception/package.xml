@@ -3,7 +3,7 @@
 <package format="3">
   <name>rover_perception</name>
   <version>0.1.0</version>
-  <description>Perception nodes for the D435i rover: YOLO detector (TensorRT) and depth terrain grid.</description>
+  <description>Perception nodes for the D435i rover: YOLO detector (TensorRT) and depth terrain detection.</description>
   <maintainer email="noreply@example.com">Robotics-cam team</maintainer>
   <license>MIT</license>
 
@@ -12,6 +12,10 @@
   <exec_depend>vision_msgs</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>message_filters</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <!-- ultralytics, torch and tensorrt come from the venv (scripts/05_setup_yolo_venv.sh), not rosdep -->
 
