@@ -6,14 +6,18 @@ in front of the camera, classify bumps / dips / steep / hidden cells, and report
 
 Subscribes (launch the camera with profile:=terrain, emitter on):
     <camera_ns>/depth/image_rect_raw, <camera_ns>/depth/camera_info, <camera_ns>/imu (optional)
+Optional: TF odom -> camera (from cuVSLAM / OpenVINS / wheel odometry). When it is available the
+node fuses frames into a rolling 6 x 6 m map in `odom` that follows the robot, so hazards stay put
+as it drives, rocks seen from several angles fill in, and crater floors appear as the rover nears.
+Without it, every frame is a fresh single-frame map in `terrain_ground`.
+
 Publishes:
-    /terrain/grid      nav_msgs/OccupancyGrid  (-1 unknown, 0 free, 100 hazard) in frame `terrain_ground`
-    /terrain/features  std_msgs/String         JSON list of features
+    /terrain/grid      nav_msgs/OccupancyGrid  (-1 unknown, 0 free, 100 hazard) in `odom` (rolling)
+                       or `terrain_ground` (single frame). Nav2 reads it, see config/nav2_terrain_costmap.yaml
+    /terrain/features  std_msgs/String         JSON list of features (positions in the grid's frame)
     /terrain/image     sensor_msgs/Image       top-down map: red bumps, blue dips, yellow hidden (debug_image:=true)
     TF  <depth optical frame> -> terrain_ground (ground below the camera, x forward, y left, z up)
 
-This is a single-frame map. Phase 3 of docs/ROADMAP.md accumulates frames into a rolling grid in
-`odom` once odometry exists, and feeds a Nav2 costmap layer.
 """
 import json
 import time
@@ -23,14 +27,17 @@ import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import OccupancyGrid
+from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.time import Time
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image, Imu
 from std_msgs.msg import String
-from tf2_ros import TransformBroadcaster
+from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
 
 from rover_perception.depth_utils import DEPTH_SCALE_M
-from rover_perception.terrain_core import TerrainParams, analyze_depth, render_map, to_occupancy
+from rover_perception.terrain_core import (RollingGrid, TerrainParams, analyze_depth, ground_pose_in_odom,
+                                           matrix_from_quat, render_map, to_occupancy)
 
 
 def quat_from_matrix(m):
@@ -59,6 +66,10 @@ class TerrainNode(Node):
         self.declare_parameter("use_imu", True)
         self.declare_parameter("debug_image", False)
         self.declare_parameter("max_rate_hz", 5.0)     # terrain changes slowly; save CPU
+        self.declare_parameter("use_odom", True)       # fuse frames in odom when TF odom -> camera exists
+        self.declare_parameter("odom_frame", "odom")
+        self.declare_parameter("map_size", 6.0)        # m, rolling map side length
+        self.declare_parameter("forget_s", 30.0)       # clear cells not seen for this long
         for name in ("resolution", "max_range", "min_range", "width", "step_up", "step_down", "max_slope_deg"):
             self.declare_parameter(name, float(getattr(d, name)))
         self.declare_parameter("pixel_step", d.pixel_step)
@@ -89,6 +100,13 @@ class TerrainNode(Node):
         self.img_pub = self.create_publisher(Image, "terrain/image", 1) if self.debug else None
         self.tf = TransformBroadcaster(self)
         self.warned = set()
+        self.odom_frame = gp("odom_frame").value
+        self.rolling = None
+        if gp("use_odom").value:
+            self.tf_buffer = Buffer()
+            self.tf_listener = TransformListener(self.tf_buffer, self)
+            self.rolling = RollingGrid(self.params, size_m=float(gp("map_size").value),
+                                       forget_s=float(gp("forget_s").value))
 
     def on_info(self, msg):
         self.K = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
@@ -118,14 +136,19 @@ class TerrainNode(Node):
             self._warn_once(res.message)
 
         self._publish_tf(msg, res)
-        self._publish_grid(msg, res)
-        feats = [f.as_dict() for f in res.features]
+        stamp_s = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        out, frame, origin = res, self.ground_frame, res.grid_origin(self.params)
+        pose = self._odom_pose(msg, res) if self.rolling is not None else None
+        if pose is not None:
+            self.rolling.update(res, pose, stamp_s)
+            out, frame, origin = self.rolling.result(), self.odom_frame, self.rolling.origin
+        self._publish_grid(msg, out, frame, origin)
+        feats = [f.as_dict() for f in out.features]
         self.feat_pub.publish(String(data=json.dumps({
-            "stamp": msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
-            "frame": self.ground_frame, "camera_height": round(res.camera_height, 3),
-            "process_ms": round(ms, 1), "features": feats})))
+            "stamp": stamp_s, "frame": frame, "camera_height": round(res.camera_height, 3),
+            "process_ms": round((time.perf_counter() - t0) * 1000, 1), "features": feats})))
         if self.img_pub is not None:
-            img = self.bridge.cv2_to_imgmsg(np.ascontiguousarray(render_map(res.classes)), "bgr8")
+            img = self.bridge.cv2_to_imgmsg(np.ascontiguousarray(render_map(out.classes)), "bgr8")
             img.header = msg.header
             self.img_pub.publish(img)
         self.get_logger().info(
@@ -143,15 +166,31 @@ class TerrainNode(Node):
         t.transform.rotation.x, t.transform.rotation.y, t.transform.rotation.z, t.transform.rotation.w = qx, qy, qz, qw
         self.tf.sendTransform(t)
 
-    def _publish_grid(self, msg, res):
+    def _odom_pose(self, msg, res):
+        """Pose of this frame's ground frame in odom, or None (single-frame mode) without TF."""
+        try:
+            t = self.tf_buffer.lookup_transform(self.odom_frame, msg.header.frame_id,
+                                                Time.from_msg(msg.header.stamp), Duration(seconds=0.05))
+        except TransformException:
+            try:
+                t = self.tf_buffer.lookup_transform(self.odom_frame, msg.header.frame_id, Time())
+            except TransformException as e:
+                self._warn_once(f"no TF {self.odom_frame} -> {msg.header.frame_id} ({e.__class__.__name__}); "
+                                "single-frame mode until odometry is running")
+                return None
+        q, tr = t.transform.rotation, t.transform.translation
+        R = matrix_from_quat(q.x, q.y, q.z, q.w)
+        return ground_pose_in_odom(R, np.array([tr.x, tr.y, tr.z]), res)
+
+    def _publish_grid(self, msg, res, frame, origin):
         p = self.params
         occ = to_occupancy(res.classes)             # (nx along x, ny along y)
         g = OccupancyGrid()
         g.header.stamp = msg.header.stamp
-        g.header.frame_id = self.ground_frame
+        g.header.frame_id = frame
         g.info.resolution = float(p.resolution)
         g.info.width, g.info.height = occ.shape[0], occ.shape[1]
-        g.info.origin.position.x, g.info.origin.position.y = res.grid_origin(p)
+        g.info.origin.position.x, g.info.origin.position.y = float(origin[0]), float(origin[1])
         g.info.origin.orientation.w = 1.0
         g.data = occ.T.flatten().tolist()           # row-major with x fastest
         self.grid_pub.publish(g)

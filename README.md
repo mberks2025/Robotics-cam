@@ -73,7 +73,10 @@ ros2 topic echo /detections --once
 # Camera + terrain detection (depth + IMU, emitter on)
 ros2 launch robot_bringup terrain.launch.py debug_image:=true
 ros2 topic echo /terrain/features      # JSON: kind, x/y position, length, width, height, volume
-# rviz2: Fixed Frame terrain_ground, Map display on /terrain/grid, Image display on /terrain/image
+# With odometry (TF odom -> camera) it keeps a rolling 6 x 6 m map in odom; without it, single frames.
+ros2 launch robot_bringup terrain.launch.py fake_odom:=true   # bench test of the rolling map, camera held still
+# rviz2: Fixed Frame odom (terrain_ground without odometry), Map display on /terrain/grid, Image on /terrain/image
+# Nav2: merge ros2_ws/src/robot_bringup/config/nav2_terrain_costmap.yaml into your Nav2 params
 
 # Terrain detection without ROS (opens the camera itself), or on a simulated scene
 python3 tools/terrain_detect.py --headless
@@ -94,7 +97,7 @@ file's argument list; the node still applies them.
 | `/camera/camera/imu` | sensor_msgs/Imu | ~200 Hz |
 | `/camera/camera/aligned_depth_to_color/image_raw` | sensor_msgs/Image | detect profile only |
 | `/detections` | vision_msgs/Detection3DArray | up to color rate |
-| `/terrain/grid` | nav_msgs/OccupancyGrid (-1 unknown, 0 free, 100 hazard) | up to 5 Hz |
+| `/terrain/grid` | nav_msgs/OccupancyGrid (-1 unknown, 0 free, 100 hazard), in `odom` when odometry runs | up to 5 Hz |
 | `/terrain/features` | std_msgs/String (JSON) | up to 5 Hz |
 
 ### First-day checklist
@@ -116,7 +119,8 @@ ros2_ws/src/robot_bringup/   camera profiles (config/*.yaml) and launch files
 ros2_ws/src/rover_perception/
   rover_perception/yolo_detector.py   YOLO node: color + aligned depth in, Detection3DArray out
   rover_perception/depth_utils.py     box_distance() from the original script, pixel -> 3D
-  rover_perception/terrain_core.py    ground fit, 5 cm height map, bumps / dips / hidden areas, features (numpy only)
+  rover_perception/terrain_core.py    ground fit, 5 cm height map, bumps / dips / hidden areas, features,
+                                      rolling odom map that fuses frames (numpy only)
   rover_perception/terrain_node.py    ROS 2 wrapper: /terrain/grid, /terrain/features, /terrain/image, TF
 models/yolo26n.pt            COCO weights the team tested; the .engine is built on the Jetson (gitignored)
 tools/realsense_detect.py    original standalone YOLO test (opens the camera itself)

@@ -73,6 +73,9 @@ class TerrainResult:
     ground_normal_opt: np.ndarray = None     # unit "up" in the camera optical frame
     R_ground_from_opt: np.ndarray = None     # rotation optical -> ground frame
     hidden_below: np.ndarray = None          # hidden cells where the ground is lower than expected (in a hole)
+    shadow: np.ndarray = None                # hidden cells blocked by something in front
+    gap_free: np.ndarray = None              # unobserved cells whose depth matches flat ground
+    points_ground: np.ndarray = None         # (N, 3) points: x fwd, y left (relative to camera), z = height
     ok: bool = True
     message: str = ""
 
@@ -187,23 +190,29 @@ def analyze_depth(depth_m, fx, fy, cx, cy, up_prior=None, params=TerrainParams()
         hmean = np.where(hits > 0, hsum / np.maximum(hits, 1), np.nan).astype(np.float32)
     observed = hits >= params.min_hits
 
-    classes = np.full((nx, ny), UNKNOWN, np.uint8)
-    classes[observed] = FREE
-    steep = _steep_cells(hmean, observed, params)
-    classes[steep] = STEEP
-    classes[observed & (hmin < -params.step_down)] = DIP
-    classes[observed & (hmax > params.step_up)] = BUMP
+    classes = classify(hmean, hmax, hmin, observed, params)
     shadow, below, gap_free = _check_unobserved(observed, params, nx, ny, depth_m, (fx, fy, cx, cy), R, cam_h)
     classes[gap_free] = FREE
     classes[shadow | below] = HIDDEN
 
     res = TerrainResult(classes, hmean, _nanify(hmax, observed), _nanify(hmin, observed), hits,
                         camera_height=float(cam_h), ground_normal_opt=n, R_ground_from_opt=R,
-                        hidden_below=below)
+                        hidden_below=below, shadow=shadow, gap_free=gap_free, points_ground=g)
     res.features = extract_features(res, params)
     if up_prior is not None and not used_prior:
         res.message = "ground found without the IMU prior (check IMU axes)"
     return res
+
+
+def classify(hmean, hmax, hmin, observed, params):
+    """Observed cells -> FREE / STEEP / DIP / BUMP; the rest UNKNOWN."""
+    classes = np.full(observed.shape, UNKNOWN, np.uint8)
+    classes[observed] = FREE
+    classes[_steep_cells(hmean, observed, params)] = STEEP
+    with np.errstate(invalid="ignore"):
+        classes[observed & (hmin < -params.step_down)] = DIP
+        classes[observed & (hmax > params.step_up)] = BUMP
+    return classes
 
 
 def _nanify(a, mask):
@@ -312,7 +321,10 @@ def _components(mask, reach=2):
     return out
 
 
-def extract_features(res, params):
+def extract_features(res, params, origin=None):
+    """Group hazard cells into features. origin = (x, y) of cell (0, 0)'s corner in the grid's
+    frame; default is the single-frame grid (camera ground frame)."""
+    x0, y0 = origin if origin is not None else (0.0, -params.width / 2)
     r = params.resolution
     area = r * r
     feats = []
@@ -323,8 +335,8 @@ def extract_features(res, params):
             if len(rows) < params.min_feature_cells:
                 continue
             hidden_n = int(np.count_nonzero(res.classes[rows, cols] == HIDDEN))
-            xs = (rows + 0.5) * r
-            ys = (cols + 0.5) * r - params.width / 2
+            xs = x0 + (rows + 0.5) * r
+            ys = y0 + (cols + 0.5) * r
             if kind == "bump":
                 h = res.hmax[rows, cols]
                 height = float(np.nanmax(h))
@@ -374,10 +386,11 @@ def render_map(classes, scale=6):
 # ---------------------------------------------------------------- synthetic scene (for tests)
 
 def synthetic_scene(width=320, height=240, hfov_deg=87.0, cam_height=0.55, tilt_deg=30.0,
-                    terrain=None, max_dist=6.0, step=0.005):
+                    terrain=None, max_dist=6.0, step=0.005, cam_x=0.0, cam_y=0.0, yaw_deg=0.0):
     """Ray-cast a depth image (metres) of a heightfield, like the Oct 15 simulated test.
 
-    terrain(x, y) -> ground height (m), x forward, y left, in the ground frame below the camera.
+    terrain(x, y) -> ground height (m), x forward, y left, in the world frame. The camera sits at
+    (cam_x, cam_y, cam_height) facing yaw_deg (0 = +x); depth is in the camera's own frame.
     Returns depth_m, (fx, fy, cx, cy), up vector in the optical frame (what the IMU would give).
     """
     if terrain is None:
@@ -392,8 +405,10 @@ def synthetic_scene(width=320, height=240, hfov_deg=87.0, cam_height=0.55, tilt_
     R = np.array([[0.0, -np.sin(t), np.cos(t)],
                   [-1.0, 0.0, 0.0],
                   [0.0, -np.cos(t), -np.sin(t)]])
-    d_g = d_opt @ R.T
-    origin = np.array([0.0, 0.0, cam_height])
+    c, s_ = np.cos(np.radians(yaw_deg)), np.sin(np.radians(yaw_deg))
+    Rz = np.array([[c, -s_, 0.0], [s_, c, 0.0], [0.0, 0.0, 1.0]])
+    d_g = d_opt @ (Rz @ R).T
+    origin = np.array([cam_x, cam_y, cam_height])
     depth = np.zeros((height, width))
     alive = np.ones((height, width), bool)
     for s in np.arange(0.1, max_dist, step):
@@ -420,3 +435,173 @@ def default_terrain(x, y):
     rc = ((x - 1.78) ** 2 + y ** 2) / 0.225 ** 2
     z = np.where(rc < 1, -0.25 * np.sqrt(np.clip(1 - rc, 0, 1)), z)
     return z
+
+
+# ---------------------------------------------------------------- rolling map (several frames)
+
+def matrix_from_quat(x, y, z, w):
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+
+
+def ground_pose_in_odom(R_odom_opt, t_odom_opt, res):
+    """(x, y, yaw) in odom of the ground frame below the camera (TerrainResult from one frame)."""
+    origin = R_odom_opt @ (-res.camera_height * res.ground_normal_opt) + t_odom_opt
+    x_axis = R_odom_opt @ res.R_ground_from_opt[0]
+    return float(origin[0]), float(origin[1]), float(np.arctan2(x_axis[1], x_axis[0]))
+
+
+class RollingGrid:
+    """Robot-centred 5 cm grid in a fixed frame (odom) that fuses single-frame results.
+
+    Each frame's points are placed with the frame's pose in odom (x, y, heading of the ground
+    frame below the camera). Heights stay relative to the ground fitted in that frame, so the map
+    needs no global elevation. Per cell, the per-frame max / min / mean height are blended with an
+    exponential average (alpha), which smooths single-frame noise; a cell seen again overwrites
+    "hidden" flags. Cells not seen for forget_s seconds are cleared. The grid recentres on the robot
+    when it moves more than recentre_m from the grid centre.
+    """
+
+    def __init__(self, params=TerrainParams(), size_m=6.0, alpha=0.4, forget_s=30.0, recentre_m=1.0):
+        self.p = params
+        self.n = int(round(size_m / params.resolution))
+        self.alpha, self.forget_s, self.recentre_m = alpha, forget_s, recentre_m
+        self.origin = None          # (x, y) of cell (0, 0)'s corner, in odom
+        self.reset()
+
+    def reset(self):
+        n = self.n
+        self.hmax = np.full((n, n), np.nan, np.float32)
+        self.hmin = np.full((n, n), np.nan, np.float32)
+        self.hmean = np.full((n, n), np.nan, np.float32)
+        self.nobs = np.zeros((n, n), np.int32)
+        self.last = np.full((n, n), -np.inf)
+        self.below = np.zeros((n, n), bool)
+        self.shadow = np.zeros((n, n), bool)
+        self.gap_free = np.zeros((n, n), bool)
+
+    # -- grid placement
+    def _centre_on(self, x, y):
+        r = self.p.resolution
+        half = self.n * r / 2
+        new = (np.floor((x - half) / r) * r, np.floor((y - half) / r) * r)
+        if self.origin is None:
+            self.origin = new
+            return
+        di = int(round((new[0] - self.origin[0]) / r))
+        dj = int(round((new[1] - self.origin[1]) / r))
+        if di == 0 and dj == 0:
+            return
+        fills = {"hmax": np.nan, "hmin": np.nan, "hmean": np.nan, "nobs": 0, "last": -np.inf,
+                 "below": False, "shadow": False, "gap_free": False}
+        for name, fill in fills.items():
+            setattr(self, name, _shift(getattr(self, name), di, dj, fill))
+        self.origin = (self.origin[0] + di * r, self.origin[1] + dj * r)
+
+    def _cells(self, x, y):
+        r = self.p.resolution
+        i = np.floor((x - self.origin[0]) / r).astype(np.int64)
+        j = np.floor((y - self.origin[1]) / r).astype(np.int64)
+        ok = (i >= 0) & (i < self.n) & (j >= 0) & (j < self.n)
+        return i, j, ok
+
+    # -- update
+    def update(self, res, pose_xy_yaw, stamp):
+        """Fuse one TerrainResult. pose_xy_yaw = (x, y, yaw) of the camera's ground frame in odom."""
+        if not res.ok:
+            return
+        x, y, yaw = pose_xy_yaw
+        if self.origin is None:
+            self._centre_on(x, y)
+        else:
+            cx = self.origin[0] + self.n * self.p.resolution / 2
+            cy = self.origin[1] + self.n * self.p.resolution / 2
+            if np.hypot(x - cx, y - cy) > self.recentre_m:
+                self._centre_on(x, y)
+        c, s = np.cos(yaw), np.sin(yaw)
+
+        def to_odom(gx, gy):
+            return x + c * gx - s * gy, y + s * gx + c * gy
+
+        # Observed cells: bin this frame's points directly in odom.
+        g = res.points_ground
+        ox, oy = to_odom(g[:, 0], g[:, 1])
+        fwd = (g[:, 0] >= 0) & (g[:, 0] < self.p.max_range) & (np.abs(g[:, 1]) < self.p.width / 2)
+        i, j, ok = self._cells(ox, oy)
+        ok &= fwd
+        i, j, h = i[ok], j[ok], g[ok, 2]
+        n = self.n
+        flat = i * n + j
+        hits = np.bincount(flat, minlength=n * n).reshape(n, n)
+        hsum = np.bincount(flat, weights=h, minlength=n * n).reshape(n, n)
+        fmax = np.full(n * n, -np.inf)
+        fmin = np.full(n * n, np.inf)
+        np.maximum.at(fmax, flat, h)
+        np.minimum.at(fmin, flat, h)
+        fmax, fmin = fmax.reshape(n, n), fmin.reshape(n, n)
+        seen = hits >= self.p.min_hits
+        fmean = np.where(seen, hsum / np.maximum(hits, 1), np.nan)
+
+        a = self.alpha
+        first = seen & (self.nobs == 0)
+        again = seen & (self.nobs > 0)
+        for arr, new in ((self.hmax, fmax), (self.hmin, fmin), (self.hmean, fmean)):
+            arr[first] = new[first]
+            arr[again] = (1 - a) * arr[again] + a * new[again]
+        self.nobs[seen] += 1
+        self.last[seen] = stamp
+        self.below[seen] = self.shadow[seen] = self.gap_free[seen] = False
+
+        # Unobserved cells of this frame: carry the hidden / gap flags over by cell centre.
+        r = self.p.resolution
+        for flag, arr in ((res.hidden_below, self.below), (res.shadow, self.shadow), (res.gap_free, self.gap_free)):
+            if flag is None:
+                continue
+            fi, fj = np.nonzero(flag)
+            gx = (fi + 0.5) * r
+            gy = (fj + 0.5) * r - self.p.width / 2
+            ci, cj, cok = self._cells(*to_odom(gx, gy))
+            ci, cj = ci[cok], cj[cok]
+            fresh = self.nobs[ci, cj] == 0
+            arr[ci[fresh], cj[fresh]] = True
+            self.last[ci[fresh], cj[fresh]] = stamp
+
+        # Forget stale cells.
+        stale = (stamp - self.last) > self.forget_s
+        if stale.any():
+            for arr in (self.hmax, self.hmin, self.hmean):
+                arr[stale] = np.nan
+            self.nobs[stale] = 0
+            self.below[stale] = self.shadow[stale] = self.gap_free[stale] = False
+            self.last[stale] = -np.inf
+
+    # -- outputs
+    def classes(self):
+        observed = self.nobs > 0
+        cls = classify(self.hmean, self.hmax, self.hmin, observed, self.p)
+        cls[self.gap_free & ~observed] = FREE
+        cls[(self.below | self.shadow) & ~observed] = HIDDEN
+        return cls
+
+    def result(self):
+        """A TerrainResult view of the map (features positioned in odom)."""
+        cls = self.classes()
+        res = TerrainResult(cls, self.hmean.copy(), self.hmax.copy(), self.hmin.copy(), self.nobs.copy(),
+                            hidden_below=self.below & (self.nobs == 0))
+        res.features = extract_features(res, self.p, origin=self.origin)
+        return res
+
+
+def _shift(a, di, dj, fill):
+    """Move grid contents so cell (i, j) of the old grid lands on (i - di, j - dj); new cells = fill."""
+    out = np.full_like(a, fill)
+    n0, n1 = a.shape
+    src_i = slice(max(di, 0), n0 + min(di, 0))
+    dst_i = slice(max(-di, 0), n0 + min(-di, 0))
+    src_j = slice(max(dj, 0), n1 + min(dj, 0))
+    dst_j = slice(max(-dj, 0), n1 + min(-dj, 0))
+    if abs(di) < n0 and abs(dj) < n1:
+        out[dst_i, dst_j] = a[src_i, src_j]
+    return out

@@ -13,7 +13,7 @@ One ROS 2 Jazzy graph. Every node reads three transforms (REP 105): `map -> odom
 | --- | --- | --- | --- |
 | Odometry | Isaac ROS Visual SLAM (cuVSLAM), GPU, stereo IR + IMU | OpenVINS (CPU), run on the same bags | Isaac ROS 4.x is the Jazzy / JetPack 7 line; confirm Orin Nano support |
 | Tags | `isaac_ros_apriltag` (GPU), tag36h11 | `apriltag_ros` (CPU, ~5 Hz) | small `tag_localizer` node publishes smoothed `map -> odom`; tag poses in a YAML map |
-| Terrain | depth-only 5 cm grid (`rover_perception/terrain_node.py`, single-frame today); next: rolling grid in `odom` + custom Nav2 costmap layer | `elevation_mapping_cupy` (GPU, more RAM) | emitter-on depth; IMU gravity for "up" |
+| Terrain | depth-only 5 cm grid (`rover_perception/terrain_node.py`): rolling 6 x 6 m map in `odom`, read by Nav2's StaticLayer (`config/nav2_terrain_costmap.yaml`); custom costmap layer only if that is too slow | `elevation_mapping_cupy` (GPU, more RAM) | emitter-on depth; IMU gravity for "up" |
 | Navigation | Nav2: Smac Planner 2D + Regulated Pure Pursuit | Smac Hybrid-A* (car-like), MPPI only if needed | recoveries trimmed to back up and wait; collision monitor stop zone |
 | Labels | YOLO26n TensorRT FP16 (this repo) | Isaac ROS YOLOv8 or bare TensorRT runtime if RAM is tight | optional; only for people / targets |
 | Mapping | deferred | RTAB-Map fed by cuVSLAM odometry | only if a saved 3D map is needed |
@@ -33,7 +33,7 @@ odometry, so terrain work can run alongside Phase 2.
 | **0. Sensor bring-up (now, this repo)** | realsense-ros on Jazzy / JetPack 7.2, USB 3, top power mode; IR pair, depth, IMU; YOLO TensorRT benchmark; record walk-around bags | 30 Hz images and 200 Hz IMU steady; test bag saved; RAM measured |
 | 1. Odometry | Kalibr camera-IMU calibration; cuVSLAM and OpenVINS on the same bags | Odometry chosen on measured drift, CPU and RAM |
 | 2. AprilTag localization | Survey tag poses into a tag map; `tag_localizer` publishes `map -> odom`; heading from the first tag at start-up | Pose snaps back to the tag map whenever a tag is seen |
-| 3. Terrain grid | ROS 2 terrain node done (single frame, tested in simulation); next: rolling odom grid, custom costmap layer, physical tests | 30-40 cm boulders and craters flagged on real terrain |
+| 3. Terrain grid | Done in simulation: terrain node, rolling odom map, Nav2 costmap config. Next: physical tests, rover step / slope thresholds | 30-40 cm boulders and craters flagged on real terrain |
 | 4. Nav2 autonomy | URDF, both costmaps, Smac 2D + Pure Pursuit; preset targets from YAML | Repeated runs reach preset targets without help |
 | 5. Hardening | Rear D435i into odometry, tags and terrain; dust and tracking-loss drills; optional YOLO, MPPI | Full mission runs end to end, hands off |
 

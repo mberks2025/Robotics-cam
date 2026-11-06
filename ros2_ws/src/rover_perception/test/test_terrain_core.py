@@ -71,3 +71,61 @@ def test_occupancy_values(scene):
     occ = to_occupancy(res.classes)
     assert set(np.unique(occ)) <= {-1, 0, 100}
     assert np.all(occ[res.classes == BUMP] == 100)
+
+
+# ---------------------------------------------------------------- rolling map
+
+from rover_perception.terrain_core import RollingGrid, ground_pose_in_odom  # noqa: E402
+
+
+def _optical_to_world(cam_x, cam_y, yaw_deg, tilt_deg=30.0, cam_h=0.55):
+    t, y = np.radians(tilt_deg), np.radians(yaw_deg)
+    R = np.array([[0.0, -np.sin(t), np.cos(t)], [-1.0, 0.0, 0.0], [0.0, -np.cos(t), -np.sin(t)]])
+    Rz = np.array([[np.cos(y), -np.sin(y), 0], [np.sin(y), np.cos(y), 0], [0, 0, 1]])
+    return Rz @ R, np.array([cam_x, cam_y, cam_h])
+
+
+def test_ground_pose_from_tf():
+    depth, K, up = synthetic_scene(160, 120, cam_x=0.4, cam_y=-0.2, yaw_deg=20)
+    res = analyze_depth(depth, *K, up_prior=up)
+    R, t = _optical_to_world(0.4, -0.2, 20)
+    x, y, yaw = ground_pose_in_odom(R, t, res)
+    assert abs(x - 0.4) < 0.02 and abs(y + 0.2) < 0.02 and abs(np.degrees(yaw) - 20) < 1.5
+
+
+@pytest.fixture(scope="module")
+def drive():
+    """Drive forward 0.9 m in four steps, then turn 25 deg left."""
+    rg = RollingGrid()
+    poses = [(0.0, 0.0, 0.0), (0.3, 0.0, 0.0), (0.6, 0.0, 0.0), (0.9, 0.0, 0.0), (0.9, 0.0, 25.0)]
+    for k, (x, y, yaw) in enumerate(poses):
+        depth, K, up = synthetic_scene(240, 180, cam_x=x, cam_y=y, yaw_deg=yaw)
+        res = analyze_depth(depth, *K, up_prior=up)
+        R, t = _optical_to_world(x, y, yaw)
+        rg.update(res, ground_pose_in_odom(R, t, res), float(k))
+    return rg
+
+
+def test_rolling_map_keeps_hazards_in_place(drive):
+    feats = drive.result().features
+    b = _find(feats, "bump", 1.0, -0.45)
+    assert abs(b.height - 0.20) < 0.03
+    _find(feats, "bump", 1.2, 0.6)
+    _find(feats, "dip", 1.78, 0.0)
+
+
+def test_rolling_map_sees_further_into_crater(drive):
+    c = _find(drive.result().features, "dip", 1.78, 0.0)
+    assert c.height > 0.18                       # true depth 0.25 m; one frame from 1.8 m away sees ~0.14
+
+
+def test_forget_and_recentre():
+    rg = RollingGrid(forget_s=5.0, recentre_m=0.5)
+    depth, K, up = synthetic_scene(160, 120)
+    res = analyze_depth(depth, *K, up_prior=up)
+    rg.update(res, (0.0, 0.0, 0.0), 0.0)
+    seen = int((rg.nobs > 0).sum())
+    rg.update(res, (2.0, 0.0, 0.0), 1.0)         # pretend we jumped 2 m: grid recentres, old cells shift
+    assert rg.origin[0] == pytest.approx(-1.0)      # grid now centred on x = 2 m (6 m map)
+    rg.update(res, (2.0, 0.0, 0.0), 20.0)        # cells from t=0 and t=1 are stale now
+    assert int((rg.nobs > 0).sum()) <= seen
